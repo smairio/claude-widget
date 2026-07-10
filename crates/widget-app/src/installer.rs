@@ -1,13 +1,19 @@
-//! Idempotent install / uninstall of the widget's hooks into `~/.claude/settings.json`.
+//! Idempotent install / uninstall of the widget's hooks and statusline entry into
+//! `~/.claude/settings.json`.
 //!
 //! The widget receives Claude Code hook events by having each hook POST its stdin
 //! JSON to the daemon's loopback listener via `curl` (a `command` hook — empirically
 //! confirmed to fire in the VS Code panel in spike #2, unlike `statusLine`).
 //!
+//! The usage gauge (#8) is fed by a `statusLine` entry running our emitter
+//! (`claude-widget statusline`). Claude Code supports exactly ONE statusline, so a
+//! foreign one is left untouched (with a warning) — we never steal the slot.
+//!
 //! The merge is surgical: it only ever adds/refreshes/removes hook groups that carry
-//! our sentinel URL, and it never touches unrelated settings keys (e.g. `effortLevel`,
-//! `model`) or a user's own hooks. If the settings file exists but does not parse, we
-//! refuse to write rather than destroy hand-edited content.
+//! our sentinel URL and a statusline that is recognizably ours, and it never touches
+//! unrelated settings keys (e.g. `effortLevel`, `model`) or a user's own hooks. If the
+//! settings file exists but does not parse, we refuse to write rather than destroy
+//! hand-edited content.
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +43,38 @@ fn hook_command(port: u16) -> String {
 /// Sentinel substring identifying a hook group as ours (so we refresh/remove only ours).
 fn sentinel(port: u16) -> String {
     format!("http://127.0.0.1:{port}/event")
+}
+
+/// How the `statusLine` slot ended up after an install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatuslineOutcome {
+    /// Our emitter is (now) the configured statusline.
+    Installed,
+    /// A foreign statusline was already configured; we left it alone, so the usage
+    /// gauge has no data source. Carries the foreign command for the warning.
+    KeptForeign(String),
+}
+
+/// The statusline command for the currently running binary. Quoted: the path may
+/// contain spaces once users unpack the portable build anywhere.
+fn statusline_command() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "claude-widget".into());
+    format!("\"{exe}\" statusline")
+}
+
+/// True if a `statusLine` value is exactly the shape we write: `"<path>" statusline`
+/// with a binary named `claude-widget`. A substring test is not enough — a user's own
+/// script may well live under a path containing "claude-widget" (this repo does), and
+/// misclassifying it as ours would displace it on install and delete it on uninstall.
+fn statusline_is_ours(v: &Value) -> bool {
+    v.get("command")
+        .and_then(Value::as_str)
+        .and_then(|c| c.strip_prefix('"'))
+        .and_then(|c| c.strip_suffix("\" statusline"))
+        .map(|exe| Path::new(exe).file_name() == Some(std::ffi::OsStr::new("claude-widget")))
+        .unwrap_or(false)
 }
 
 fn invalid_data(msg: String) -> std::io::Error {
@@ -91,14 +129,14 @@ fn strip_ours(arr: &[Value], sentinel: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Install (or refresh) the widget's hooks at the default settings path.
-pub fn install(port: u16) -> std::io::Result<PathBuf> {
+/// Install (or refresh) the widget's hooks + statusline at the default settings path.
+pub fn install(port: u16) -> std::io::Result<(PathBuf, StatuslineOutcome)> {
     let path = settings_path();
-    install_at(&path, port)?;
-    Ok(path)
+    let outcome = install_at(&path, port, &statusline_command())?;
+    Ok((path, outcome))
 }
 
-/// Remove the widget's hooks at the default settings path.
+/// Remove the widget's hooks and statusline at the default settings path.
 pub fn uninstall(port: u16) -> std::io::Result<PathBuf> {
     let path = settings_path();
     uninstall_at(&path, port)?;
@@ -106,8 +144,8 @@ pub fn uninstall(port: u16) -> std::io::Result<PathBuf> {
 }
 
 /// Install into an explicit settings file. Idempotent: re-running replaces only our
-/// groups and leaves foreign hooks and every other settings key untouched.
-pub fn install_at(path: &Path, port: u16) -> std::io::Result<()> {
+/// groups/statusline and leaves foreign hooks and every other settings key untouched.
+pub fn install_at(path: &Path, port: u16, statusline_cmd: &str) -> std::io::Result<StatuslineOutcome> {
     let mut root = read_settings(path)?;
     let obj = root
         .as_object_mut()
@@ -132,7 +170,27 @@ pub fn install_at(path: &Path, port: u16) -> std::io::Result<()> {
         hooks_obj.insert((*event).to_string(), Value::Array(kept));
     }
 
-    write_settings(path, &root)
+    // The statusline slot: take it if free or already ours (refreshing the path in case
+    // the binary moved); never displace a foreign statusline.
+    let outcome = match obj.get("statusLine") {
+        Some(existing) if !statusline_is_ours(existing) => StatuslineOutcome::KeptForeign(
+            existing
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("<non-command statusline>")
+                .to_string(),
+        ),
+        _ => {
+            obj.insert(
+                "statusLine".into(),
+                json!({ "type": "command", "command": statusline_cmd }),
+            );
+            StatuslineOutcome::Installed
+        }
+    };
+
+    write_settings(path, &root)?;
+    Ok(outcome)
 }
 
 /// Remove only the widget's hooks from an explicit settings file. Prunes empty event
@@ -140,6 +198,13 @@ pub fn install_at(path: &Path, port: u16) -> std::io::Result<()> {
 pub fn uninstall_at(path: &Path, port: u16) -> std::io::Result<()> {
     let mut root = read_settings(path)?;
     let sentinel = sentinel(port);
+
+    // Drop the statusline only if it is ours; a foreign one is not ours to remove.
+    if let Some(obj) = root.as_object_mut() {
+        if obj.get("statusLine").map(statusline_is_ours).unwrap_or(false) {
+            obj.remove("statusLine");
+        }
+    }
 
     if let Some(hooks_obj) = root
         .as_object_mut()
@@ -171,6 +236,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const PORT: u16 = 43110;
+    /// A stand-in for the real exe-derived statusline command.
+    const CMD: &str = "\"/opt/claude-widget\" statusline";
 
     /// A fresh, unique settings path per test — no shared global state, parallel-safe.
     fn temp_settings() -> PathBuf {
@@ -190,7 +257,7 @@ mod tests {
     fn install_preserves_unrelated_keys() {
         let path = temp_settings();
         write_settings(&path, &json!({"effortLevel": "xhigh", "model": "opus[1m]"})).unwrap();
-        install_at(&path, PORT).unwrap();
+        install_at(&path, PORT, CMD).unwrap();
         let v = read(&path);
         assert_eq!(v["effortLevel"], "xhigh");
         assert_eq!(v["model"], "opus[1m]");
@@ -200,8 +267,8 @@ mod tests {
     #[test]
     fn install_is_idempotent() {
         let path = temp_settings();
-        install_at(&path, PORT).unwrap();
-        install_at(&path, PORT).unwrap();
+        install_at(&path, PORT, CMD).unwrap();
+        install_at(&path, PORT, CMD).unwrap();
         let v = read(&path);
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
     }
@@ -214,7 +281,7 @@ mod tests {
             &json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo foreign"}]}]}}),
         )
         .unwrap();
-        install_at(&path, PORT).unwrap();
+        install_at(&path, PORT, CMD).unwrap();
         let stop = read(&path)["hooks"]["Stop"].as_array().unwrap().clone();
         assert_eq!(stop.len(), 2, "foreign group kept + ours added");
         assert!(stop.iter().any(|g| g["hooks"][0]["command"] == "echo foreign"));
@@ -228,7 +295,7 @@ mod tests {
             &json!({"effortLevel": "xhigh", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo foreign"}]}]}}),
         )
         .unwrap();
-        install_at(&path, PORT).unwrap();
+        install_at(&path, PORT, CMD).unwrap();
         uninstall_at(&path, PORT).unwrap();
         let v = read(&path);
         assert_eq!(v["effortLevel"], "xhigh");
@@ -241,7 +308,7 @@ mod tests {
     fn uninstall_with_no_foreign_hooks_drops_hooks_key() {
         let path = temp_settings();
         write_settings(&path, &json!({"model": "opus"})).unwrap();
-        install_at(&path, PORT).unwrap();
+        install_at(&path, PORT, CMD).unwrap();
         uninstall_at(&path, PORT).unwrap();
         let v = read(&path);
         assert_eq!(v["model"], "opus");
@@ -249,11 +316,72 @@ mod tests {
     }
 
     #[test]
+    fn install_takes_the_free_statusline_slot() {
+        let path = temp_settings();
+        let outcome = install_at(&path, PORT, CMD).unwrap();
+        assert_eq!(outcome, StatuslineOutcome::Installed);
+        let v = read(&path);
+        assert_eq!(v["statusLine"]["type"], "command");
+        assert_eq!(v["statusLine"]["command"], CMD);
+    }
+
+    #[test]
+    fn install_refreshes_our_statusline_when_the_binary_moved() {
+        let path = temp_settings();
+        install_at(&path, PORT, CMD).unwrap();
+        let moved = "\"/new/place/claude-widget\" statusline";
+        let outcome = install_at(&path, PORT, moved).unwrap();
+        assert_eq!(outcome, StatuslineOutcome::Installed);
+        assert_eq!(read(&path)["statusLine"]["command"], moved);
+    }
+
+    #[test]
+    fn foreign_statusline_is_never_displaced() {
+        let path = temp_settings();
+        write_settings(
+            &path,
+            &json!({"statusLine": {"type": "command", "command": "my-fancy-prompt"}}),
+        )
+        .unwrap();
+        let outcome = install_at(&path, PORT, CMD).unwrap();
+        assert_eq!(outcome, StatuslineOutcome::KeptForeign("my-fancy-prompt".into()));
+        let v = read(&path);
+        assert_eq!(v["statusLine"]["command"], "my-fancy-prompt");
+        assert!(v["hooks"]["Stop"].is_array(), "hooks still installed");
+        // Uninstall must not remove the foreign statusline either.
+        uninstall_at(&path, PORT).unwrap();
+        assert_eq!(read(&path)["statusLine"]["command"], "my-fancy-prompt");
+    }
+
+    #[test]
+    fn uninstall_removes_our_statusline() {
+        let path = temp_settings();
+        install_at(&path, PORT, CMD).unwrap();
+        uninstall_at(&path, PORT).unwrap();
+        assert!(read(&path).get("statusLine").is_none());
+    }
+
+    #[test]
+    fn foreign_statusline_under_a_claude_widget_path_is_still_foreign() {
+        // Regression: a user's own script may live under a path containing
+        // "claude-widget" (this repo does). It must never be classified as ours.
+        let foreign = "/home/user/Desktop/claude-widget/scripts/statusline.sh";
+        let path = temp_settings();
+        write_settings(&path, &json!({"statusLine": {"type": "command", "command": foreign}}))
+            .unwrap();
+        let outcome = install_at(&path, PORT, CMD).unwrap();
+        assert_eq!(outcome, StatuslineOutcome::KeptForeign(foreign.into()));
+        assert_eq!(read(&path)["statusLine"]["command"], foreign);
+        uninstall_at(&path, PORT).unwrap();
+        assert_eq!(read(&path)["statusLine"]["command"], foreign, "not ours to remove");
+    }
+
+    #[test]
     fn unparseable_settings_is_never_clobbered() {
         let path = temp_settings();
         std::fs::write(&path, "{ this is not json,,, ").unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
-        assert!(install_at(&path, PORT).is_err(), "must refuse to write");
+        assert!(install_at(&path, PORT, CMD).is_err(), "must refuse to write");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "file left intact");
     }
 
@@ -261,6 +389,6 @@ mod tests {
     fn non_object_settings_is_rejected() {
         let path = temp_settings();
         std::fs::write(&path, "[1, 2, 3]").unwrap();
-        assert!(install_at(&path, PORT).is_err());
+        assert!(install_at(&path, PORT, CMD).is_err());
     }
 }

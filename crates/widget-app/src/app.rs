@@ -18,6 +18,11 @@ const REGISTRY_POLL_MS: u64 = 2_000;
 /// don't spam. (Needs-you / rate-limit notifications always fire — they're actionable.)
 const NOTIFY_LONG_TURN_MS: u64 = 20_000;
 
+/// A usage snapshot older than this is shown as stale. The statusline refreshes it every
+/// few seconds while any terminal session is active, so minutes of silence means the
+/// source is quiet (e.g. only panel sessions, which never run the statusline).
+const USAGE_STALE_SECS: u64 = 15 * 60;
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -40,6 +45,11 @@ pub struct WidgetApp {
     /// Minimum turn length to notify "finished" (default 20s; override CW_NOTIFY_MS).
     notify_ms: u64,
     transcript: crate::transcript::TranscriptReader,
+    /// Last-known account-global usage snapshot (written by the statusline emitter).
+    usage: Option<widget_core::UsageSnapshot>,
+    /// Snapshot file mtime at the last read, so unchanged files are not re-parsed.
+    usage_mtime: Option<std::time::SystemTime>,
+    usage_stale_secs: u64,
 }
 
 impl WidgetApp {
@@ -63,6 +73,37 @@ impl WidgetApp {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(NOTIFY_LONG_TURN_MS),
             transcript: crate::transcript::TranscriptReader::new(),
+            usage: None,
+            usage_mtime: None,
+            usage_stale_secs: std::env::var("CW_USAGE_STALE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|ms| (ms / 1000).max(1))
+                .unwrap_or(USAGE_STALE_SECS),
+        }
+    }
+
+    /// Re-read the shared usage snapshot if its file changed. A missing or unparseable
+    /// file keeps the last-known snapshot (staleness will surface it honestly).
+    fn poll_usage(&mut self) {
+        let path = crate::emitter::snapshot_path();
+        let Ok(meta) = std::fs::metadata(&path) else { return };
+        let mtime = meta.modified().ok();
+        // Skip only on a *known-equal* mtime; if mtime is unreadable, keep re-reading
+        // rather than wedging on None == None forever.
+        if self.usage.is_some() && mtime.is_some() && mtime == self.usage_mtime {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else { return };
+        if let Some(snap) = widget_core::parse_usage_snapshot(&contents) {
+            self.dbg(&format!(
+                "usage snapshot: 5h={:?} 7d={:?} written_at={}",
+                snap.five_hour.as_ref().map(|w| w.used_percentage),
+                snap.seven_day.as_ref().map(|w| w.used_percentage),
+                snap.written_at
+            ));
+            self.usage = Some(snap);
+            self.usage_mtime = mtime;
         }
     }
 
@@ -140,6 +181,15 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Traffic-light color for a gauge tier (RGBs from the Claude Code theme; see spike #3).
+fn gauge_color(tier: widget_core::GaugeTier) -> egui::Color32 {
+    match tier {
+        widget_core::GaugeTier::Calm => egui::Color32::from_rgb(78, 186, 101),
+        widget_core::GaugeTier::Warn => egui::Color32::from_rgb(255, 193, 7),
+        widget_core::GaugeTier::Alert => egui::Color32::from_rgb(255, 107, 128),
+    }
+}
+
 fn presentation(state: AggregateState) -> (&'static str, egui::Color32) {
     match state {
         AggregateState::NoSessions => ("no sessions", egui::Color32::from_gray(95)),
@@ -174,6 +224,7 @@ impl eframe::App for WidgetApp {
         // empty) and drop any whose process is gone. Never wipe on a transient read error.
         if now.saturating_sub(self.last_registry_ms) >= REGISTRY_POLL_MS {
             self.last_registry_ms = now;
+            self.poll_usage();
             if let Some(live) = crate::registry::live_sessions() {
                 let ids: std::collections::BTreeSet<String> =
                     live.iter().map(|s| s.session_id.clone()).collect();
@@ -271,6 +322,67 @@ impl eframe::App for WidgetApp {
                             .size(11.0)
                             .color(egui::Color32::from_gray(110)),
                     );
+                }
+
+                // Usage-limit gauge: account-global 5h/7d bars from the statusline
+                // snapshot. No snapshot (or no windows) -> section simply absent, the
+                // card degrades to the tokens-only rows above.
+                if let Some(snap) = &self.usage {
+                    let g = widget_core::gauge_view(snap, now / 1000, self.usage_stale_secs);
+                    if !g.windows.is_empty() {
+                        ui.add_space(10.0);
+                        for w in &g.windows {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(w.label)
+                                        .size(11.0)
+                                        .color(egui::Color32::from_gray(140)),
+                                );
+                                // Track + fill; stale data draws dimmed, never as current.
+                                let width = (ui.available_width() - 88.0).max(30.0);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(width, 7.0),
+                                    egui::Sense::hover(),
+                                );
+                                let mut fill_color = gauge_color(w.tier);
+                                if g.stale {
+                                    fill_color = fill_color.gamma_multiply(0.45);
+                                }
+                                let painter = ui.painter();
+                                painter.rect_filled(rect, 3.5, egui::Color32::from_gray(45));
+                                if w.pct > 0.0 {
+                                    let mut fill = rect;
+                                    fill.set_width(rect.width() * (w.pct as f32 / 100.0));
+                                    painter.rect_filled(fill, 3.5, fill_color);
+                                }
+                                let right = match w.resets_in_secs {
+                                    Some(s) => format!(
+                                        "{}% · {}",
+                                        w.pct.round() as i64,
+                                        widget_core::fmt_countdown(s)
+                                    ),
+                                    None => format!("{}%", w.pct.round() as i64),
+                                };
+                                ui.label(
+                                    egui::RichText::new(right)
+                                        .size(10.0)
+                                        .color(egui::Color32::from_gray(140)),
+                                );
+                            });
+                        }
+                        // Freshness, always: the snapshot is last-known-from-any-terminal-
+                        // session (the statusline never runs in the VS Code panel).
+                        let age = (now / 1000).saturating_sub(g.as_of_secs);
+                        let mut as_of = format!("as of {} ago", widget_core::fmt_countdown(age));
+                        if g.stale {
+                            as_of.push_str(" · stale");
+                        }
+                        ui.label(
+                            egui::RichText::new(as_of)
+                                .size(10.0)
+                                .color(egui::Color32::from_gray(if g.stale { 130 } else { 105 })),
+                        );
+                    }
                 }
             });
     }

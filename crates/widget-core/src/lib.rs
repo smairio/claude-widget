@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+pub mod usage;
+pub use usage::*;
+
 /// What a single Claude Code session is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {

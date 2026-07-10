@@ -1,11 +1,13 @@
 //! Claude Code status widget — always-on-top desktop card fed by Claude Code hooks.
 //!
 //! Usage:
-//!   claude-widget            run the widget (default)
-//!   claude-widget install    merge the widget's hooks into ~/.claude/settings.json
-//!   claude-widget uninstall  remove them again
+//!   claude-widget             run the widget (default)
+//!   claude-widget install     merge the widget's hooks + statusline into ~/.claude/settings.json
+//!   claude-widget uninstall   remove them again
+//!   claude-widget statusline  statusline emitter (Claude Code runs this, not you)
 
 mod app;
+mod emitter;
 mod installer;
 mod registry;
 mod server;
@@ -17,10 +19,25 @@ const PORT: u16 = 43110;
 
 fn main() -> eframe::Result<()> {
     match std::env::args().nth(1).as_deref() {
+        // The statusline emitter: headless, must work with no display. Claude Code
+        // invokes it on every statusline refresh with the payload on stdin.
+        Some("statusline") => {
+            emitter::run();
+            return Ok(());
+        }
         Some("install") => {
             match installer::install(PORT) {
-                Ok(p) => {
+                Ok((p, outcome)) => {
                     println!("Installed Claude-widget hooks -> {}", p.display());
+                    match outcome {
+                        installer::StatuslineOutcome::Installed => {
+                            println!("Statusline emitter configured (feeds the usage gauge from terminal sessions).");
+                        }
+                        installer::StatuslineOutcome::KeptForeign(cmd) => {
+                            eprintln!("WARNING: you already have a statusline ({cmd}); it was left untouched.");
+                            eprintln!("The usage gauge stays empty unless your statusline also runs: claude-widget statusline");
+                        }
+                    }
                     println!("Restart your Claude Code session so the hooks load.");
                 }
                 Err(e) => {
@@ -41,7 +58,7 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
         Some("--help") | Some("-h") => {
-            println!("claude-widget [install|uninstall]  (no arg = run the widget)");
+            println!("claude-widget [install|uninstall|statusline]  (no arg = run the widget)");
             return Ok(());
         }
         _ => {}
@@ -75,7 +92,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([270.0, 195.0])
+            .with_inner_size([270.0, 240.0])
             .with_min_inner_size([220.0, 140.0])
             .with_decorations(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
