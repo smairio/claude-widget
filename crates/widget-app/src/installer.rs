@@ -19,6 +19,7 @@ const EVENTS: &[&str] = &[
     "PreToolUse",
     "PostToolUse",
     "Stop",
+    "StopFailure",
     "SessionEnd",
 ];
 
