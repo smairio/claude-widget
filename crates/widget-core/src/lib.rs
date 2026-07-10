@@ -47,7 +47,9 @@ pub enum HookEvent {
     PostToolUse { tool_name: String, is_subagent: bool },
     Stop,
     /// Turn ended on an error (rate limit, overload, …). Fires *instead of* `Stop`.
-    StopFailure,
+    /// `error` is the error kind used for matching (docs v2.1.205 field is `error`;
+    /// some tools call it `error_type` — we accept either).
+    StopFailure { error: Option<String> },
     SessionEnd,
     /// A hook we observe but that does not drive a transition on its own.
     Other(String),
@@ -85,6 +87,12 @@ struct RawHook {
     /// Present only when the event fires inside a subagent.
     #[serde(default)]
     agent_id: Option<String>,
+    /// StopFailure error kind (v2.1.205 name).
+    #[serde(default)]
+    error: Option<String>,
+    /// StopFailure error kind (alternate name some tools use).
+    #[serde(default)]
+    error_type: Option<String>,
 }
 
 /// Parse a single hook payload (the JSON delivered on the hook's stdin / HTTP body).
@@ -103,7 +111,7 @@ pub fn parse_hook(json: &str) -> Result<ParsedEvent, ParseError> {
             is_subagent,
         },
         Some("Stop") => HookEvent::Stop,
-        Some("StopFailure") => HookEvent::StopFailure,
+        Some("StopFailure") => HookEvent::StopFailure { error: raw.error.or(raw.error_type) },
         Some("SessionEnd") => HookEvent::SessionEnd,
         Some(other) => HookEvent::Other(other.to_string()),
         None => HookEvent::Other(String::new()),
@@ -125,10 +133,26 @@ struct Session {
 pub fn next_state(current: Option<SessionState>, event: &HookEvent) -> Option<SessionState> {
     match event {
         HookEvent::UserPromptSubmit => Some(SessionState::Working),
-        HookEvent::PreToolUse { .. } => Some(SessionState::Working),
+        HookEvent::PreToolUse { tool_name, is_subagent } => {
+            // A main-thread AskUserQuestion means Claude is blocked on the user (this is
+            // how "needs you" surfaces in the VS Code panel — see spike #3 / Claude-Familiar
+            // #52). A subagent's AskUserQuestion must NOT hijack the main card.
+            if tool_name == "AskUserQuestion" && !is_subagent {
+                Some(SessionState::WaitingForInput)
+            } else {
+                Some(SessionState::Working)
+            }
+        }
+        // A completed tool call (including the user answering the question) resumes work.
         HookEvent::PostToolUse { .. } => Some(SessionState::Working),
         HookEvent::Stop => Some(SessionState::Idle),
-        HookEvent::StopFailure => Some(SessionState::Idle),
+        HookEvent::StopFailure { error } => {
+            if error.as_deref() == Some("rate_limit") {
+                Some(SessionState::RateLimited)
+            } else {
+                Some(SessionState::Idle)
+            }
+        }
         HookEvent::SessionEnd => None,
         HookEvent::Other(_) => current,
     }
@@ -297,6 +321,66 @@ mod tests {
         r.apply_raw(&hook("PreToolUse", "s1")).unwrap();
         r.apply_raw(&hook("StopFailure", "s1")).unwrap();
         assert_eq!(r.state_of("s1"), Some(SessionState::Idle), "errored turn must not stick working");
+    }
+
+    #[test]
+    fn main_thread_ask_user_question_sets_waiting() {
+        let mut r = Roster::new();
+        let json = r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"AskUserQuestion"}"#;
+        r.apply_raw(json).unwrap();
+        assert_eq!(r.state_of("s1"), Some(SessionState::WaitingForInput));
+        assert_eq!(r.aggregate(), AggregateState::WaitingForInput);
+    }
+
+    #[test]
+    fn subagent_ask_user_question_does_not_hijack() {
+        let mut r = Roster::new();
+        let json = r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"AskUserQuestion","agent_id":"sub-1"}"#;
+        r.apply_raw(json).unwrap();
+        assert_eq!(r.state_of("s1"), Some(SessionState::Working), "subagent question must not set waiting");
+    }
+
+    #[test]
+    fn answering_the_question_resumes_working() {
+        let mut r = Roster::new();
+        r.apply_raw(r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"AskUserQuestion"}"#).unwrap();
+        assert_eq!(r.state_of("s1"), Some(SessionState::WaitingForInput));
+        r.apply_raw(r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"AskUserQuestion"}"#).unwrap();
+        assert_eq!(r.state_of("s1"), Some(SessionState::Working));
+    }
+
+    #[test]
+    fn stop_failure_rate_limit_sets_rate_limited() {
+        let mut r = Roster::new();
+        r.apply_raw(r#"{"hook_event_name":"PreToolUse","session_id":"s1"}"#).unwrap();
+        r.apply_raw(r#"{"hook_event_name":"StopFailure","session_id":"s1","error":"rate_limit"}"#).unwrap();
+        assert_eq!(r.state_of("s1"), Some(SessionState::RateLimited));
+        assert_eq!(r.aggregate(), AggregateState::RateLimited);
+    }
+
+    #[test]
+    fn stop_failure_accepts_error_type_alias() {
+        let mut r = Roster::new();
+        r.apply_raw(r#"{"hook_event_name":"StopFailure","session_id":"s1","error_type":"rate_limit"}"#).unwrap();
+        assert_eq!(r.state_of("s1"), Some(SessionState::RateLimited));
+    }
+
+    #[test]
+    fn waiting_survives_the_stall_backstop() {
+        // A pending question may sit for a long time while the user is away; the short
+        // backstop (which only idles Working) must not clear it.
+        let mut r = Roster::new();
+        r.apply_raw_at(r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"AskUserQuestion"}"#, 1_000).unwrap();
+        r.expire_stale(1_000_000, 45_000);
+        assert_eq!(r.state_of("s1"), Some(SessionState::WaitingForInput));
+    }
+
+    #[test]
+    fn aggregate_prefers_waiting_over_working() {
+        let mut r = Roster::new();
+        r.apply_raw(r#"{"hook_event_name":"PreToolUse","session_id":"a","tool_name":"Bash"}"#).unwrap(); // working
+        r.apply_raw(r#"{"hook_event_name":"PreToolUse","session_id":"b","tool_name":"AskUserQuestion"}"#).unwrap(); // waiting
+        assert_eq!(r.aggregate(), AggregateState::WaitingForInput);
     }
 
     #[test]

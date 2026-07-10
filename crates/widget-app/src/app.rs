@@ -14,6 +14,10 @@ const STALL_TIMEOUT_MS: u64 = 45_000;
 /// How often to re-read the session registry (enumerate new sessions, drop gone ones).
 const REGISTRY_POLL_MS: u64 = 2_000;
 
+/// Only notify "Claude finished" for turns that ran at least this long, so quick turns
+/// don't spam. (Needs-you / rate-limit notifications always fire — they're actionable.)
+const NOTIFY_LONG_TURN_MS: u64 = 20_000;
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -29,6 +33,12 @@ pub struct WidgetApp {
     last_agg: Option<AggregateState>,
     last_registry_ms: u64,
     last_count: usize,
+    /// When the aggregate last entered Working (for the long-turn-finished notification).
+    working_since: Option<u64>,
+    /// Notifications on unless CW_NO_NOTIFY is set.
+    notify_enabled: bool,
+    /// Minimum turn length to notify "finished" (default 20s; override CW_NOTIFY_MS).
+    notify_ms: u64,
 }
 
 impl WidgetApp {
@@ -45,7 +55,31 @@ impl WidgetApp {
             last_agg: None,
             last_registry_ms: 0,
             last_count: 0,
+            working_since: None,
+            notify_enabled: std::env::var_os("CW_NO_NOTIFY").is_none(),
+            notify_ms: std::env::var("CW_NOTIFY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(NOTIFY_LONG_TURN_MS),
         }
+    }
+
+    /// Fire a desktop notification (and log it under CW_DEBUG). Never blocks or panics.
+    fn notify(&self, summary: &str, body: &str) {
+        self.dbg(&format!("notify: {summary} — {body}"));
+        if !self.notify_enabled {
+            return;
+        }
+        // Fire on a background thread — show() is a synchronous DBus round-trip and must
+        // not stall the render thread.
+        let (summary, body) = (summary.to_string(), body.to_string());
+        std::thread::spawn(move || {
+            let _ = notify_rust::Notification::new()
+                .summary(&summary)
+                .body(&body)
+                .appname("Claude Widget")
+                .show();
+        });
     }
 
     /// When CW_DEBUG is set, append a timestamped line to ~/.claude/claude-widget-debug.log.
@@ -57,6 +91,33 @@ impl WidgetApp {
         let path = std::path::Path::new(&home).join(".claude").join("claude-widget-debug.log");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{} {msg}", now_ms());
+        }
+    }
+}
+
+impl WidgetApp {
+    /// Fire notifications and maintain the turn timer on an aggregate-state change.
+    /// Called only when `to != from`, so entering a state notifies exactly once.
+    fn handle_transition(&mut self, from: Option<AggregateState>, to: AggregateState, now: u64, saw_stop: bool) {
+        use AggregateState::*;
+        match to {
+            WaitingForInput => self.notify("Claude needs you", "A session is waiting for your input."),
+            RateLimited => self.notify("Claude — rate limit reached", "The turn stopped on a rate limit."),
+            Idle | NoSessions => {
+                if from == Some(Working) && saw_stop {
+                    if let Some(ws) = self.working_since {
+                        if now.saturating_sub(ws) >= self.notify_ms {
+                            self.notify("Claude finished", "A long turn just completed.");
+                        }
+                    }
+                }
+                self.working_since = None;
+            }
+            Working => {}
+        }
+        // Start the turn timer when entering Working (spans a mid-turn wait/resume).
+        if to == Working && self.working_since.is_none() {
+            self.working_since = Some(now);
         }
     }
 }
@@ -84,6 +145,11 @@ impl eframe::App for WidgetApp {
             self.dbg(&format!("recv session={} event={:?}", ev.session_id, ev.event));
             self.roster.apply_at(ev, now);
         }
+        // "Finished" should mean a real turn end, not an interrupt (backstop) or a session
+        // disappearing — so only when an actual Stop arrived this frame.
+        let saw_stop = drained
+            .iter()
+            .any(|e| matches!(e.event, widget_core::HookEvent::Stop));
 
         // Registry sync (throttled): the session registry is the authority for WHICH
         // sessions exist. Enumerate live ones (so the card is populated at startup, not
@@ -106,10 +172,12 @@ impl eframe::App for WidgetApp {
         // event (user interrupt fires no Stop; an error fires StopFailure).
         self.roster.expire_stale(now, self.stall_ms);
 
-        // Log aggregate transitions from ANY cause (events or the backstop).
+        // React to aggregate transitions (from events OR the backstop): log, notify, and
+        // track the turn timer.
         let agg = self.roster.aggregate();
         if Some(agg) != self.last_agg {
             self.dbg(&format!("-> aggregate={agg:?} sessions={}", self.roster.len()));
+            self.handle_transition(self.last_agg, agg, now, saw_stop);
             self.last_agg = Some(agg);
         }
 
