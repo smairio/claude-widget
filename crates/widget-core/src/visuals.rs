@@ -49,6 +49,13 @@ pub enum Backdrop {
     RainbowPixels { phase: f32 },
 }
 
+/// Whether the purple wave should radiate. Post-#7 refinement (issue #13): the wave is
+/// the TOP TIER's working signature — xhigh only (ultracode rides along; Claude Code
+/// reports it as xhigh) — not a general working indicator.
+pub fn wave_active(effort: Option<EffortLevel>, any_working: bool) -> bool {
+    effort == Some(EffortLevel::XHigh) && any_working
+}
+
 /// Map an effort level to its backdrop at `t_ms`.
 pub fn effort_backdrop(effort: Option<EffortLevel>, t_ms: u64) -> Backdrop {
     match effort {
@@ -114,6 +121,18 @@ mod tests {
         assert_eq!(EffortLevel::from_level("ultracode"), Some(XHigh));
         assert_eq!(EffortLevel::from_level("MAX"), Some(Max), "case-insensitive");
         assert_eq!(EffortLevel::from_level("hyper"), None);
+    }
+
+    #[test]
+    fn wave_radiates_only_at_xhigh_while_working() {
+        assert!(wave_active(Some(XHigh), true));
+        // Not while idle, even at xhigh.
+        assert!(!wave_active(Some(XHigh), false));
+        // Not at any other tier, nor with unknown effort.
+        assert!(!wave_active(Some(Max), true));
+        assert!(!wave_active(Some(High), true));
+        assert!(!wave_active(Some(Low), true));
+        assert!(!wave_active(None, true));
     }
 
     #[test]

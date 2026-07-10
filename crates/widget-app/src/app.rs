@@ -254,7 +254,7 @@ impl eframe::App for WidgetApp {
                 let ids: std::collections::BTreeSet<String> =
                     live.iter().map(|s| s.session_id.clone()).collect();
                 for s in &live {
-                    self.roster.ensure_session(&s.session_id, s.cwd.as_deref(), now);
+                    self.roster.ensure_session(&s.session_id, s.cwd.as_deref(), s.name.as_deref(), now);
                 }
                 self.roster.retain_live(&ids);
                 // Tail each live session's transcript for model + accumulated tokens.
@@ -267,8 +267,10 @@ impl eframe::App for WidgetApp {
                     for v in self.roster.sessions_view() {
                         let id: String = v.session_id.chars().take(8).collect();
                         self.dbg(&format!(
-                            "view {id} project={} model={} tokens={}",
+                            "view {id} project={} name={} active={} model={} tokens={}",
                             v.project,
+                            v.name.as_deref().unwrap_or("-"),
+                            v.active,
                             v.model.as_deref().unwrap_or("-"),
                             v.tokens
                         ));
@@ -379,7 +381,8 @@ impl eframe::App for WidgetApp {
 
                     // The working wave: staggered purple rings emanating from the mascot
                     // (purple → transparent → purple), fading as they cross the card.
-                    if animate && any_working {
+                    // Top-tier signature only (#13): xhigh working, not every working.
+                    if animate && widget_core::wave_active(effort, any_working) {
                         let max_r = card.width().max(card.height());
                         for k in 0..3 {
                             let (prog, alpha) = widget_core::wave_ring(k, 3, anim_t);
@@ -450,10 +453,15 @@ impl eframe::App for WidgetApp {
                 }
                 for v in rows.iter().take(3) {
                     let model = v.model.as_deref().map(short_model).unwrap_or("—");
+                    // Registry session name distinguishes same-project sessions; a
+                    // never-active session (registry-only, e.g. VS Code's spare panel
+                    // tab) renders dimmed until it does something.
+                    let label = v.name.as_deref().unwrap_or(&v.project);
+                    let shade = if v.active { 150 } else { 95 };
                     ui.label(
-                        egui::RichText::new(format!("{} · {} · {}", v.project, model, fmt_tokens(v.tokens)))
+                        egui::RichText::new(format!("{} · {} · {}", label, model, fmt_tokens(v.tokens)))
                             .size(12.0)
-                            .color(egui::Color32::from_gray(150)),
+                            .color(egui::Color32::from_gray(shade)),
                     );
                 }
                 if rows.len() > 3 {

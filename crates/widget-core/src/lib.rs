@@ -254,9 +254,15 @@ pub fn project_label(cwd: Option<&str>) -> String {
 pub struct SessionView {
     pub session_id: String,
     pub project: String,
+    /// Registry-provided session name (e.g. "claude-widget-b0") — distinguishes several
+    /// sessions in one project. The UI falls back to `project` when absent.
+    pub name: Option<String>,
     pub state: SessionState,
     pub model: Option<String>,
     pub tokens: u64,
+    /// False for a session known only from the registry — it has never fired a hook nor
+    /// produced transcript data (e.g. VS Code's spare panel session). The UI dims these.
+    pub active: bool,
 }
 
 /// Per-session record: state + last-activity (for the backstop) + registry cwd + the
@@ -270,6 +276,10 @@ struct Session {
     usage: Usage,
     /// Last effort level a hook payload reported for this session.
     effort: Option<EffortLevel>,
+    /// Registry-provided session name.
+    name: Option<String>,
+    /// True once the session shows life beyond registry existence (hook or transcript).
+    active: bool,
 }
 
 impl Session {
@@ -281,6 +291,8 @@ impl Session {
             model: None,
             usage: Usage::default(),
             effort: None,
+            name: None,
+            active: false,
         }
     }
 }
@@ -340,6 +352,7 @@ impl Roster {
                     .or_insert_with(|| Session::new_idle(now_ms));
                 entry.state = state;
                 entry.last_activity_ms = now_ms;
+                entry.active = true;
                 if ev.effort.is_some() {
                     entry.effort = ev.effort;
                 }
@@ -367,9 +380,10 @@ impl Roster {
         self.apply_raw_at(json, 0)
     }
 
-    /// Ensure a (registry-discovered) session exists, as Idle, recording its cwd, without
-    /// disturbing the state/model/usage of one we already track. Called on registry sync.
-    pub fn ensure_session(&mut self, session_id: &str, cwd: Option<&str>, now_ms: u64) {
+    /// Ensure a (registry-discovered) session exists, as Idle, recording its cwd and
+    /// registry name, without disturbing the state/model/usage/activity of one we
+    /// already track. Called on registry sync — never marks a session active.
+    pub fn ensure_session(&mut self, session_id: &str, cwd: Option<&str>, name: Option<&str>, now_ms: u64) {
         let entry = self
             .sessions
             .entry(session_id.to_string())
@@ -377,11 +391,14 @@ impl Roster {
         if entry.cwd.is_none() {
             entry.cwd = cwd.map(str::to_string);
         }
+        if entry.name.is_none() {
+            entry.name = name.map(str::to_string);
+        }
     }
 
     /// Back-compat helper: ensure a session exists as Idle with no cwd.
     pub fn ensure_idle(&mut self, session_id: &str, now_ms: u64) {
-        self.ensure_session(session_id, None, now_ms);
+        self.ensure_session(session_id, None, None, now_ms);
     }
 
     /// Apply an assistant message from the transcript: set the session's model and add the
@@ -394,21 +411,28 @@ impl Roster {
             }
             // Latest message = current context footprint (see Usage docs).
             s.usage = update.usage;
+            s.active = true;
         }
     }
 
-    /// Per-session snapshots for the UI, ordered by session id (stable rows).
+    /// Per-session snapshots for the UI: active sessions first, then by session id
+    /// (stable rows within each group).
     pub fn sessions_view(&self) -> Vec<SessionView> {
-        self.sessions
+        let mut rows: Vec<SessionView> = self
+            .sessions
             .iter()
             .map(|(id, s)| SessionView {
                 session_id: id.clone(),
                 project: project_label(s.cwd.as_deref()),
+                name: s.name.clone(),
                 state: s.state,
                 model: s.model.clone(),
                 tokens: s.usage.total(),
+                active: s.active,
             })
-            .collect()
+            .collect();
+        rows.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.session_id.cmp(&b.session_id)));
+        rows
     }
 
     /// Drop every session whose id is not in `live` (its process is gone / registry entry
@@ -691,7 +715,7 @@ mod tests {
     #[test]
     fn apply_transcript_sets_model_and_reports_latest_footprint() {
         let mut r = Roster::new();
-        r.ensure_session("s1", Some("/home/khalil/Desktop/claude-widget"), 0);
+        r.ensure_session("s1", Some("/home/khalil/Desktop/claude-widget"), None, 0);
         let mk = |inp: u64| TranscriptUpdate {
             session_id: "s1".into(),
             model: Some("claude-fable-5".into()),
@@ -720,7 +744,7 @@ mod tests {
     #[test]
     fn hook_state_change_preserves_model_and_tokens() {
         let mut r = Roster::new();
-        r.ensure_session("s1", Some("/x/proj"), 0);
+        r.ensure_session("s1", Some("/x/proj"), None, 0);
         r.apply_transcript(&TranscriptUpdate {
             session_id: "s1".into(),
             model: Some("claude-opus-4-8".into()),
@@ -777,6 +801,45 @@ mod tests {
         r2.apply_raw_at(&hook("UserPromptSubmit", "s9"), 100).unwrap();
         r2.apply_raw_at(&ev("UserPromptSubmit", "s1", "xhigh"), 50).unwrap();
         assert_eq!(r2.current_effort(), Some(EffortLevel::XHigh));
+    }
+
+    #[test]
+    fn registry_only_sessions_are_inactive_until_they_show_life() {
+        let mut r = Roster::new();
+        r.ensure_session("s1", Some("/p/app"), Some("app-b0"), 10);
+        let v = &r.sessions_view()[0];
+        assert!(!v.active, "registry existence alone is not activity");
+        assert_eq!(v.name.as_deref(), Some("app-b0"));
+        // A hook event marks it active…
+        r.apply_raw_at(&hook("UserPromptSubmit", "s1"), 20).unwrap();
+        assert!(r.sessions_view()[0].active);
+        // …and repeated registry syncs never reset activity or overwrite the name.
+        r.ensure_session("s1", Some("/p/app"), Some("app-RENAMED"), 30);
+        let v = &r.sessions_view()[0];
+        assert!(v.active);
+        assert_eq!(v.name.as_deref(), Some("app-b0"));
+        // Transcript data alone also counts as life.
+        let mut r2 = Roster::new();
+        r2.ensure_session("s2", Some("/p/app"), None, 10);
+        r2.apply_transcript(&TranscriptUpdate {
+            session_id: "s2".into(),
+            model: Some("m".into()),
+            usage: Usage { input_tokens: 5, ..Default::default() },
+        });
+        assert!(r2.sessions_view()[0].active);
+    }
+
+    #[test]
+    fn sessions_view_puts_active_rows_first() {
+        let mut r = Roster::new();
+        // "a-spare" sorts first by id but is never-active; "z-live" has fired a hook.
+        r.ensure_session("a-spare", Some("/p/app"), Some("app-64"), 10);
+        r.ensure_session("z-live", Some("/p/app"), Some("app-b0"), 10);
+        r.apply_raw_at(&hook("UserPromptSubmit", "z-live"), 20).unwrap();
+        let v = r.sessions_view();
+        assert_eq!(v[0].session_id, "z-live", "active first");
+        assert_eq!(v[1].session_id, "a-spare");
+        assert!(v[0].active && !v[1].active);
     }
 
     /// The seam test, replaying the ACTUAL recorded fixture through the real parser.

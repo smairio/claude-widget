@@ -11,6 +11,9 @@ use std::path::Path;
 pub struct LiveSession {
     pub session_id: String,
     pub cwd: Option<String>,
+    /// The registry's per-session name (e.g. "claude-widget-b0") — distinguishes
+    /// several sessions in one project on the card.
+    pub name: Option<String>,
 }
 
 fn sessions_dir() -> std::path::PathBuf {
@@ -44,6 +47,7 @@ pub fn live_sessions() -> Option<Vec<LiveSession>> {
                 live.push(LiveSession {
                     session_id: sid.to_string(),
                     cwd: value.get("cwd").and_then(serde_json::Value::as_str).map(str::to_string),
+                    name: value.get("name").and_then(serde_json::Value::as_str).map(str::to_string),
                 });
             }
         }
