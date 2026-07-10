@@ -2,11 +2,19 @@
 id: 3
 title: Choose the widget stack
 labels: [wayfinder:grilling]
-status: open
-assignee:
+status: closed
+assignee: khalil
 blocked-by: []
 parent: map
 ---
+
+## Resolution
+
+Resolved 2026-07-10 (decided with the user, implemented in #4 / commit `25cf90e`).
+
+**Stack = Rust + `eframe`/`egui`.** Single process: the eframe app hosts the loopback hook listener, the (future) file watcher, and the UI. Chosen over the map's earlier Tauri lean once the user made **portability-for-others** a first-class goal: egui compiles to a **single self-contained native binary** with no webview dependency, whereas Tauri's Linux AppImage still leans on the host's WebKitGTK (its weakest point for distribution). egui also wins on performance and is the most natural fit for the custom per-frame animations (mascot wave, rainbow-pixel field). GTK3/PySide6 (Python) were the fallbacks; Electron is out (needs Node ≥22.12, machine has 18).
+
+Window management (the main risk of the winit path) validated live: always-on-top + sticky set via `x11rb` EWMH `_NET_WM_STATE_ABOVE`/`_STICKY`, confirmed with `xprop`. Idle animation-pause and CPU budget carry into #7.
 
 ## Question
 

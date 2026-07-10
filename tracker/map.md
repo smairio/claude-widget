@@ -23,6 +23,7 @@ Working widget v1 on Khalil's desktop: an always-on-top X11 card, visible over C
 
 - [Spike: which Claude Code signals fire on this machine](tickets/01-spike-which-signals-fire.md) — hooks (incl. `Stop`) DO fire in the VS Code panel; statusLine does NOT; idle keys off `Stop`; permission-dialog events need interactive mode (deferred to #6). Details: [spike2-findings.md](assets/spike2-findings.md).
 - [Spike: does rate-limit data exist for a Team seat](tickets/02-spike-team-seat-rate-limits.md) — YES via official statusline `rate_limits`; usage source = statusline emitter (account-global, last-known-from-any-session); OAuth endpoint not needed. Also: VS Code waiting-state = `PreToolUse(AskUserQuestion)`. Prior art: [Claude-Familiar](https://github.com/NadimJebali/Claude-Familiar). Details: [spike3-findings.md](assets/spike3-findings.md).
+- [Choose the widget stack](tickets/03-choose-widget-stack.md) — **Rust + eframe/egui**, single process, single self-contained binary (portability-for-others + performance + animation fit). Window mgmt validated on X11 (`x11rb` sticky/above). Built in GitHub #4.
 
 ## Not yet specified
 
@@ -34,6 +35,11 @@ Working widget v1 on Khalil's desktop: an always-on-top X11 card, visible over C
 ## Out of scope
 
 - **Wayland support** — v1 is X11-only; a session switch needs a different windowing approach (layer-shell/GNOME extension) and would be a fresh effort.
-- **Distribution to others** — no public packaging, README-for-strangers, or cross-distro testing; installs on this machine only.
 - **OTel/Prometheus pipeline** — heavier alternative data plane; hooks + transcripts cover v1.
 - **Multi-machine aggregation** — this PC's sessions only.
+
+<!-- Scope change 2026-07-10: the user moved DISTRIBUTION-TO-OTHERS in-scope. The stack
+     choice (egui single self-contained binary) was made for portability; packaging a
+     portable artifact (AppImage / static binary, and cross-platform builds) is now part
+     of the polish ticket (#9), not excluded. -->
+
