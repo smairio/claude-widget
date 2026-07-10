@@ -10,6 +10,7 @@ Working widget v1 on Khalil's desktop: an always-on-top X11 card, visible over C
 ## Notes
 
 - **This map carries execution** (override of the plan-only default): build tickets are in scope through v1 acceptance on this machine.
+- **Implementation moved to GitHub Issues** (2026-07-10): the spec is [issue #1](https://github.com/smairio/claude-widget/issues/1) and the build is broken into tracer-bullet tickets [#2–#9](https://github.com/smairio/claude-widget/issues) with native blocked-by edges. GitHub #2/#3 correspond to this map's spike tickets 01/02; GitHub #4–#9 supersede this map's build tickets 07–10. This map remains authoritative for the open *decision* tickets (03 stack, 04 prototype, 05 usage source, 06 state spec), which resolve inside the corresponding GitHub tickets.
 - Tracker: local markdown — operations in [README.md](README.md).
 - Skills per ticket type: `/grilling` + `/domain-modeling` for decision tickets, `/prototype` for the UI ticket, `/verify` after build tickets, `/research` for any new external facts.
 - Standing preferences: prefer officially documented data sources; the unofficial `/api/oauth/usage` endpoint only as an explicit opt-in, and **never call the token-refresh endpoint** (rotating the refresh token can log Claude Code out); X11-only — detect `XDG_SESSION_TYPE` and fail loudly; avoid `transparent: true` windows on this NVIDIA machine (documented webkitgtk crash/blank bug; fallback env `WEBKIT_DISABLE_DMABUF_RENDERER=1`).
