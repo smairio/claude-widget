@@ -119,11 +119,122 @@ pub fn parse_hook(json: &str) -> Result<ParsedEvent, ParseError> {
     Ok(ParsedEvent { session_id, event })
 }
 
-/// Per-session record: current state plus the last time we saw activity (for the backstop).
-#[derive(Debug, Clone, Copy)]
+/// Token usage of a single assistant message. The widget tracks the LATEST message's
+/// usage as the session's "current context footprint" — cumulative sums balloon because
+/// `cache_read_input_tokens` re-counts the same context on every message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+impl Usage {
+    /// The message's total token footprint (input + output + both cache kinds) — a proxy
+    /// for how large the session's context currently is.
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+}
+
+/// One assistant message parsed from a transcript line: which session, its model, and the
+/// message's token usage (added to the session's running total).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptUpdate {
+    pub session_id: String,
+    pub model: Option<String>,
+    pub usage: Usage,
+}
+
+#[derive(Deserialize)]
+struct RawTranscript {
+    #[serde(rename = "type")]
+    typ: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    message: Option<RawMessage>,
+}
+
+#[derive(Deserialize)]
+struct RawMessage {
+    model: Option<String>,
+    usage: Option<RawUsage>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+}
+
+/// Parse one transcript JSONL line. Returns `Some` only for an assistant message that
+/// carries a session id; every other line type (user, queue-operation, …) returns `None`.
+/// Transcripts key the session as `sessionId` (camelCase), unlike hooks' `session_id`.
+pub fn parse_transcript_line(json: &str) -> Option<TranscriptUpdate> {
+    let raw: RawTranscript = serde_json::from_str(json).ok()?;
+    if raw.typ.as_deref() != Some("assistant") {
+        return None;
+    }
+    let session_id = raw.session_id?;
+    let message = raw.message?;
+    let u = message.usage.unwrap_or_default();
+    Some(TranscriptUpdate {
+        session_id,
+        model: message.model,
+        usage: Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+        },
+    })
+}
+
+/// The last path component of a working directory (the "project"), or "?" if unknown.
+pub fn project_label(cwd: Option<&str>) -> String {
+    cwd.and_then(|c| c.rsplit('/').find(|s| !s.is_empty()))
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// A per-session snapshot for the UI to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub session_id: String,
+    pub project: String,
+    pub state: SessionState,
+    pub model: Option<String>,
+    pub tokens: u64,
+}
+
+/// Per-session record: state + last-activity (for the backstop) + registry cwd + the
+/// model and running token total harvested from the transcript.
+#[derive(Debug, Clone)]
 struct Session {
     state: SessionState,
     last_activity_ms: u64,
+    cwd: Option<String>,
+    model: Option<String>,
+    usage: Usage,
+}
+
+impl Session {
+    fn new_idle(now_ms: u64) -> Self {
+        Session {
+            state: SessionState::Idle,
+            last_activity_ms: now_ms,
+            cwd: None,
+            model: None,
+            usage: Usage::default(),
+        }
+    }
 }
 
 /// The transition an event drives, given the current state. `None` means "drop the session".
@@ -174,10 +285,13 @@ impl Roster {
         let current = self.sessions.get(&ev.session_id).map(|s| s.state);
         match next_state(current, &ev.event) {
             Some(state) => {
-                self.sessions.insert(
-                    ev.session_id.clone(),
-                    Session { state, last_activity_ms: now_ms },
-                );
+                // Update state in place so the session's cwd/model/usage survive.
+                let entry = self
+                    .sessions
+                    .entry(ev.session_id.clone())
+                    .or_insert_with(|| Session::new_idle(now_ms));
+                entry.state = state;
+                entry.last_activity_ms = now_ms;
             }
             None => {
                 self.sessions.remove(&ev.session_id);
@@ -202,12 +316,48 @@ impl Roster {
         self.apply_raw_at(json, 0)
     }
 
-    /// Ensure a (registry-discovered) session exists, as Idle, without disturbing one we
-    /// already track. Called when the daemon reads the session registry.
-    pub fn ensure_idle(&mut self, session_id: &str, now_ms: u64) {
-        self.sessions
+    /// Ensure a (registry-discovered) session exists, as Idle, recording its cwd, without
+    /// disturbing the state/model/usage of one we already track. Called on registry sync.
+    pub fn ensure_session(&mut self, session_id: &str, cwd: Option<&str>, now_ms: u64) {
+        let entry = self
+            .sessions
             .entry(session_id.to_string())
-            .or_insert(Session { state: SessionState::Idle, last_activity_ms: now_ms });
+            .or_insert_with(|| Session::new_idle(now_ms));
+        if entry.cwd.is_none() {
+            entry.cwd = cwd.map(str::to_string);
+        }
+    }
+
+    /// Back-compat helper: ensure a session exists as Idle with no cwd.
+    pub fn ensure_idle(&mut self, session_id: &str, now_ms: u64) {
+        self.ensure_session(session_id, None, now_ms);
+    }
+
+    /// Apply an assistant message from the transcript: set the session's model and add the
+    /// message's tokens to its running total. Ignored if the session isn't tracked (the
+    /// registry is the authority for existence).
+    pub fn apply_transcript(&mut self, update: &TranscriptUpdate) {
+        if let Some(s) = self.sessions.get_mut(&update.session_id) {
+            if update.model.is_some() {
+                s.model = update.model.clone();
+            }
+            // Latest message = current context footprint (see Usage docs).
+            s.usage = update.usage;
+        }
+    }
+
+    /// Per-session snapshots for the UI, ordered by session id (stable rows).
+    pub fn sessions_view(&self) -> Vec<SessionView> {
+        self.sessions
+            .iter()
+            .map(|(id, s)| SessionView {
+                session_id: id.clone(),
+                project: project_label(s.cwd.as_deref()),
+                state: s.state,
+                model: s.model.clone(),
+                tokens: s.usage.total(),
+            })
+            .collect()
     }
 
     /// Drop every session whose id is not in `live` (its process is gone / registry entry
@@ -454,6 +604,75 @@ mod tests {
         r.apply_raw_at(&hook("PreToolUse", "s1"), 100).unwrap();
         r.ensure_idle("s1", 200); // registry re-scan should not reset it
         assert_eq!(r.state_of("s1"), Some(SessionState::Working));
+    }
+
+    #[test]
+    fn parses_assistant_transcript_line() {
+        let line = r#"{"type":"assistant","sessionId":"s1","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}}"#;
+        let u = parse_transcript_line(line).unwrap();
+        assert_eq!(u.session_id, "s1");
+        assert_eq!(u.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(u.usage.total(), 135);
+    }
+
+    #[test]
+    fn non_assistant_transcript_lines_are_ignored() {
+        assert!(parse_transcript_line(r#"{"type":"user","sessionId":"s1"}"#).is_none());
+        assert!(parse_transcript_line(r#"{"type":"queue-operation"}"#).is_none());
+        assert!(parse_transcript_line("not json").is_none());
+    }
+
+    #[test]
+    fn apply_transcript_sets_model_and_reports_latest_footprint() {
+        let mut r = Roster::new();
+        r.ensure_session("s1", Some("/home/khalil/Desktop/claude-widget"), 0);
+        let mk = |inp: u64| TranscriptUpdate {
+            session_id: "s1".into(),
+            model: Some("claude-fable-5".into()),
+            usage: Usage { input_tokens: inp, ..Default::default() },
+        };
+        r.apply_transcript(&mk(100));
+        r.apply_transcript(&mk(50));
+        let view = r.sessions_view();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(view[0].tokens, 50, "shows the latest message's footprint, not a cache-inflated sum");
+        assert_eq!(view[0].project, "claude-widget");
+    }
+
+    #[test]
+    fn transcript_update_for_unknown_session_is_ignored() {
+        let mut r = Roster::new();
+        r.apply_transcript(&TranscriptUpdate {
+            session_id: "ghost".into(),
+            model: Some("m".into()),
+            usage: Usage { input_tokens: 5, ..Default::default() },
+        });
+        assert!(r.is_empty(), "no session created for a transcript-only id");
+    }
+
+    #[test]
+    fn hook_state_change_preserves_model_and_tokens() {
+        let mut r = Roster::new();
+        r.ensure_session("s1", Some("/x/proj"), 0);
+        r.apply_transcript(&TranscriptUpdate {
+            session_id: "s1".into(),
+            model: Some("claude-opus-4-8".into()),
+            usage: Usage { output_tokens: 42, ..Default::default() },
+        });
+        // A hook flips the session to working; model/tokens must survive.
+        r.apply_raw(r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Bash"}"#).unwrap();
+        let v = &r.sessions_view()[0];
+        assert_eq!(v.state, SessionState::Working);
+        assert_eq!(v.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(v.tokens, 42);
+    }
+
+    #[test]
+    fn project_label_takes_basename() {
+        assert_eq!(project_label(Some("/home/khalil/Desktop/claude-widget")), "claude-widget");
+        assert_eq!(project_label(Some("/x/")), "x");
+        assert_eq!(project_label(None), "?");
     }
 
     /// The seam test, replaying the ACTUAL recorded fixture through the real parser.

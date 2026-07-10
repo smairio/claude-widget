@@ -39,6 +39,7 @@ pub struct WidgetApp {
     notify_enabled: bool,
     /// Minimum turn length to notify "finished" (default 20s; override CW_NOTIFY_MS).
     notify_ms: u64,
+    transcript: crate::transcript::TranscriptReader,
 }
 
 impl WidgetApp {
@@ -61,6 +62,7 @@ impl WidgetApp {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(NOTIFY_LONG_TURN_MS),
+            transcript: crate::transcript::TranscriptReader::new(),
         }
     }
 
@@ -122,6 +124,22 @@ impl WidgetApp {
     }
 }
 
+/// Trim the redundant "claude-" prefix for display (claude-opus-4-8 -> opus-4-8).
+fn short_model(model: &str) -> &str {
+    model.strip_prefix("claude-").unwrap_or(model)
+}
+
+/// Compact token count: 512, 34k, 1.2M.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 fn presentation(state: AggregateState) -> (&'static str, egui::Color32) {
     match state {
         AggregateState::NoSessions => ("no sessions", egui::Color32::from_gray(95)),
@@ -156,11 +174,30 @@ impl eframe::App for WidgetApp {
         // empty) and drop any whose process is gone. Never wipe on a transient read error.
         if now.saturating_sub(self.last_registry_ms) >= REGISTRY_POLL_MS {
             self.last_registry_ms = now;
-            if let Some(live) = crate::registry::live_session_ids() {
-                for id in &live {
-                    self.roster.ensure_idle(id, now);
+            if let Some(live) = crate::registry::live_sessions() {
+                let ids: std::collections::BTreeSet<String> =
+                    live.iter().map(|s| s.session_id.clone()).collect();
+                for s in &live {
+                    self.roster.ensure_session(&s.session_id, s.cwd.as_deref(), now);
                 }
-                self.roster.retain_live(&live);
+                self.roster.retain_live(&ids);
+                // Tail each live session's transcript for model + accumulated tokens.
+                let sessions: Vec<(String, Option<String>)> =
+                    live.into_iter().map(|s| (s.session_id, s.cwd)).collect();
+                for update in self.transcript.poll(&sessions) {
+                    self.roster.apply_transcript(&update);
+                }
+                if self.debug {
+                    for v in self.roster.sessions_view() {
+                        let id: String = v.session_id.chars().take(8).collect();
+                        self.dbg(&format!(
+                            "view {id} project={} model={} tokens={}",
+                            v.project,
+                            v.model.as_deref().unwrap_or("-"),
+                            v.tokens
+                        ));
+                    }
+                }
             }
             if self.roster.len() != self.last_count {
                 self.dbg(&format!("registry sync: sessions={}", self.roster.len()));
@@ -209,12 +246,32 @@ impl eframe::App for WidgetApp {
                 );
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(format!("● {label}")).size(24.0).color(accent));
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("{} session(s)", self.roster.len()))
-                        .size(12.0)
-                        .color(egui::Color32::from_gray(140)),
-                );
+                ui.add_space(8.0);
+
+                // Per-session rows: project · model · tokens.
+                let rows = self.roster.sessions_view();
+                if rows.is_empty() {
+                    ui.label(
+                        egui::RichText::new("no active sessions")
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(120)),
+                    );
+                }
+                for v in rows.iter().take(3) {
+                    let model = v.model.as_deref().map(short_model).unwrap_or("—");
+                    ui.label(
+                        egui::RichText::new(format!("{} · {} · {}", v.project, model, fmt_tokens(v.tokens)))
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                }
+                if rows.len() > 3 {
+                    ui.label(
+                        egui::RichText::new(format!("+{} more", rows.len() - 3))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(110)),
+                    );
+                }
             });
     }
 }

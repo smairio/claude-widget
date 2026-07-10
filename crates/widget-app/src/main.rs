@@ -10,6 +10,7 @@ mod installer;
 mod registry;
 mod server;
 mod sticky;
+mod transcript;
 
 /// Loopback port the hooks POST to and the widget listens on.
 const PORT: u16 = 43110;
@@ -74,8 +75,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([260.0, 150.0])
-            .with_min_inner_size([200.0, 110.0])
+            .with_inner_size([270.0, 195.0])
+            .with_min_inner_size([220.0, 140.0])
             .with_decorations(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
             .with_taskbar(false)
