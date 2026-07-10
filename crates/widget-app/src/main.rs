@@ -7,6 +7,7 @@
 
 mod app;
 mod installer;
+mod registry;
 mod server;
 mod sticky;
 
@@ -90,6 +91,15 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             server::spawn(listener, tx, cc.egui_ctx.clone());
             sticky::spawn_make_sticky();
+            // Heartbeat: reliably wake the UI ~1s so the registry sync and the stall
+            // backstop run even while idle and unfocused (request_repaint_after alone is
+            // not honored by winit when the loop is otherwise asleep). Events still wake
+            // it instantly via the listener's request_repaint.
+            let tick_ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                tick_ctx.request_repaint();
+            });
             Ok(Box::new(app::WidgetApp::new(rx)))
         }),
     )

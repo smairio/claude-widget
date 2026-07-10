@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use widget_core::{AggregateState, ParsedEvent, Roster};
 
@@ -10,6 +10,9 @@ use widget_core::{AggregateState, ParsedEvent, Roster};
 /// backstop). Generous so a single long thinking pass is not falsely idled; it exists to
 /// recover from user interrupts (no `Stop`) and dropped events, not to be the primary signal.
 const STALL_TIMEOUT_MS: u64 = 45_000;
+
+/// How often to re-read the session registry (enumerate new sessions, drop gone ones).
+const REGISTRY_POLL_MS: u64 = 2_000;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -24,6 +27,8 @@ pub struct WidgetApp {
     debug: bool,
     stall_ms: u64,
     last_agg: Option<AggregateState>,
+    last_registry_ms: u64,
+    last_count: usize,
 }
 
 impl WidgetApp {
@@ -38,6 +43,8 @@ impl WidgetApp {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(STALL_TIMEOUT_MS),
             last_agg: None,
+            last_registry_ms: 0,
+            last_count: 0,
         }
     }
 
@@ -78,6 +85,23 @@ impl eframe::App for WidgetApp {
             self.roster.apply_at(ev, now);
         }
 
+        // Registry sync (throttled): the session registry is the authority for WHICH
+        // sessions exist. Enumerate live ones (so the card is populated at startup, not
+        // empty) and drop any whose process is gone. Never wipe on a transient read error.
+        if now.saturating_sub(self.last_registry_ms) >= REGISTRY_POLL_MS {
+            self.last_registry_ms = now;
+            if let Some(live) = crate::registry::live_session_ids() {
+                for id in &live {
+                    self.roster.ensure_idle(id, now);
+                }
+                self.roster.retain_live(&live);
+            }
+            if self.roster.len() != self.last_count {
+                self.dbg(&format!("registry sync: sessions={}", self.roster.len()));
+                self.last_count = self.roster.len();
+            }
+        }
+
         // Stall backstop: recover a "working" session that never received a terminal
         // event (user interrupt fires no Stop; an error fires StopFailure).
         self.roster.expire_stale(now, self.stall_ms);
@@ -89,11 +113,8 @@ impl eframe::App for WidgetApp {
             self.last_agg = Some(agg);
         }
 
-        // Keep waking (~1s) while anything is working, so the backstop fires without
-        // needing a new hook event. When idle, no repaint is scheduled (cheap).
-        if self.roster.any_working() {
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
+        // Periodic ticks are driven by the heartbeat thread (see main.rs), which reliably
+        // wakes the loop even while idle/unfocused; nothing to schedule here.
 
         let (label, accent) = presentation(agg);
         let bg = egui::Color32::from_rgb(18, 18, 22);
