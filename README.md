@@ -25,10 +25,16 @@ cargo build --release
 - **The purple wave is the top tier's signature.** Rings radiate from the spark only
   while a session is working at **xhigh** effort (ultracode included — Claude Code
   reports ultracode as xhigh). Working at other efforts shows the rotating spark only.
-- **Usage bars (5h/7d) come from the statusline**, which Claude Code runs only in
-  terminal sessions — never in the VS Code panel. In panel-only workflows the card
-  shows the last snapshot any terminal session wrote, aging into an explicit "stale"
-  label. Run `claude` in a terminal once to refresh it.
+- **Usage bars (5h/7d) have two sources.** The default is the statusline, which Claude
+  Code runs only in terminal sessions — never in the VS Code panel — so panel-only
+  workflows see the last terminal snapshot, aging into an explicit "stale" label.
+  For live numbers without terminal sessions, opt in to the usage API:
+  `claude-widget usage-api on` (persisted; revoke with `off` — a running widget picks
+  up either change within seconds, no restart needed).
+  When enabled, the widget reads the OAuth token Claude Code already stores locally,
+  polls the account usage endpoint every 300s (backing off on rate limits), and
+  **never calls any token-refresh endpoint or logs the token**. Both sources write the
+  same snapshot; the freshest wins.
 - **Dimmed session rows** are sessions that exist (per Claude Code's registry) but have
   never fired a hook or produced transcript data — e.g. the spare panel session VS Code
   keeps around. They brighten the moment they do anything.

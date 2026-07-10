@@ -1,6 +1,5 @@
 //! The eframe UI: an opaque, frameless status card. Skeleton scope = working/idle.
 
-use std::io::Write;
 use std::sync::mpsc::Receiver;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -130,13 +129,8 @@ impl WidgetApp {
 
     /// When CW_DEBUG is set, append a timestamped line to ~/.claude/claude-widget-debug.log.
     fn dbg(&self, msg: &str) {
-        if !self.debug {
-            return;
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let path = std::path::Path::new(&home).join(".claude").join("claude-widget-debug.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{} {msg}", now_ms());
+        if self.debug {
+            crate::debug_log::append(msg);
         }
     }
 }
@@ -208,7 +202,7 @@ fn mix(base: egui::Color32, tint: widget_core::Rgb, t: f32) -> egui::Color32 {
 fn draw_spark(painter: &egui::Painter, center: egui::Pos2, r: f32, angle: f32, color: egui::Color32) {
     for i in 0..8 {
         let a = angle + i as f32 * std::f32::consts::FRAC_PI_4;
-        let (len, width) = if i % 2 == 0 { (r, 3.4) } else { (r * 0.55, 2.4) };
+        let (len, width) = if i % 2 == 0 { (r, 3.4_f32) } else { (r * 0.55, 2.4_f32) };
         let tip = center + egui::vec2(a.cos(), a.sin()) * len;
         painter.line_segment([center, tip], egui::Stroke::new(width, color));
     }
@@ -400,7 +394,7 @@ impl eframe::App for WidgetApp {
                                 c.2,
                                 (alpha * 255.0) as u8,
                             );
-                            painter.circle_stroke(center, prog * max_r, egui::Stroke::new(7.0, ring));
+                            painter.circle_stroke(center, prog * max_r, egui::Stroke::new(7.0_f32, ring));
                         }
                     }
 

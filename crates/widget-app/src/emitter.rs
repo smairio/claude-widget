@@ -52,7 +52,8 @@ pub fn emit(input: &str, path: &Path, now_secs: u64) -> String {
 /// never reads a torn snapshot. The temp name is per-process: Claude Code runs one
 /// statusline per session, so two terminal sessions can emit concurrently — a shared
 /// temp file would let them interleave. Last rename wins, which is fine (both are fresh).
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+/// Also used by the usage-API poller (#14) — one write path for every snapshot source.
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

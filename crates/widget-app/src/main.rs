@@ -1,14 +1,18 @@
 //! Claude Code status widget — always-on-top desktop card fed by Claude Code hooks.
 //!
 //! Usage:
-//!   claude-widget             run the widget (default)
-//!   claude-widget install     merge the widget's hooks + statusline into ~/.claude/settings.json
-//!   claude-widget uninstall   remove them again
-//!   claude-widget statusline  statusline emitter (Claude Code runs this, not you)
+//!   claude-widget                   run the widget (default)
+//!   claude-widget install           merge the widget's hooks + statusline into ~/.claude/settings.json
+//!   claude-widget uninstall         remove them again
+//!   claude-widget statusline        statusline emitter (Claude Code runs this, not you)
+//!   claude-widget usage-api on|off  opt in/out of polling the account usage endpoint
 
 mod app;
+mod config;
+mod debug_log;
 mod emitter;
 mod installer;
+mod usage_api;
 mod registry;
 mod server;
 mod sticky;
@@ -63,8 +67,43 @@ fn main() -> eframe::Result<()> {
             }
             return Ok(());
         }
+        Some("usage-api") => {
+            let path = config::config_path();
+            match std::env::args().nth(2).as_deref() {
+                Some("on") => match config::set_usage_api(&path, true) {
+                    Ok(()) => {
+                        println!("Usage-API polling ENABLED (persisted in {}).", path.display());
+                        println!("A running widget picks this up within seconds. While enabled, it will:");
+                        println!("  - read the stored OAuth access token from ~/.claude/.credentials.json");
+                        println!("  - GET {} every {}s (backing off on 429)", usage_api::ENDPOINT, usage_api::POLL_SECS);
+                        println!("  - write the 5h/7d usage snapshot the card displays");
+                        println!("It never calls any token-refresh endpoint and never logs the token.");
+                        println!("Disable anytime: claude-widget usage-api off");
+                    }
+                    Err(e) => {
+                        eprintln!("claude-widget: could not persist opt-in: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                Some("off") => match config::set_usage_api(&path, false) {
+                    Ok(()) => {
+                        println!("Usage-API polling disabled.");
+                        println!("A running widget stops before its next poll — no restart needed.");
+                    }
+                    Err(e) => {
+                        eprintln!("claude-widget: could not persist opt-out: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                _ => {
+                    eprintln!("usage: claude-widget usage-api on|off");
+                    std::process::exit(2);
+                }
+            }
+            return Ok(());
+        }
         Some("--help") | Some("-h") => {
-            println!("claude-widget [install|uninstall|statusline]  (no arg = run the widget)");
+            println!("claude-widget [install|uninstall|statusline|usage-api on|off]  (no arg = run the widget)");
             return Ok(());
         }
         _ => {}
@@ -94,6 +133,18 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
     };
+
+    // The usage-API poller thread always runs but re-reads the persisted opt-in before
+    // every request (issue #14) — so `usage-api on|off` takes effect on a running
+    // widget without a restart, and no request is ever made while opted out.
+    {
+        let debug = std::env::var_os("CW_DEBUG").is_some();
+        usage_api::spawn(move |line| {
+            if debug {
+                debug_log::append(&line);
+            }
+        });
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
 

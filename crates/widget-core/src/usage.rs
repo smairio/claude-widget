@@ -50,10 +50,14 @@ pub struct StatuslineInput {
     pub context_pct: Option<f64>,
 }
 
-/// Read one window object (`{"used_percentage": .., "resets_at": ..}`) from a JSON value.
+/// Read one window object from a JSON value. Field-name trap: the statusline calls the
+/// percentage `used_percentage`; the OAuth usage endpoint calls it `utilization`.
 fn window_from(v: &Value) -> Option<UsageWindow> {
     let obj = v.as_object()?;
-    let pct = obj.get("used_percentage").and_then(Value::as_f64)?;
+    let pct = obj
+        .get("used_percentage")
+        .or_else(|| obj.get("utilization"))
+        .and_then(Value::as_f64)?;
     Some(UsageWindow {
         used_percentage: pct.clamp(0.0, 100.0),
         resets_at: obj.get("resets_at").and_then(reset_epoch),
@@ -119,6 +123,23 @@ pub fn snapshot_json(snap: &UsageSnapshot) -> String {
     }
     root.insert("written_at".into(), snap.written_at.into());
     Value::Object(root).to_string()
+}
+
+/// Parse the OAuth usage endpoint's response body into a snapshot (the opt-in rung,
+/// issue #14). Same tolerance rules as the statusline path: windows independently
+/// absent, `utilization`/`used_percentage` both accepted, epoch or ISO `resets_at`,
+/// unknown extra windows ignored. `None` only for unparseable/shape-less JSON.
+pub fn parse_oauth_usage(json: &str, now_secs: u64) -> Option<UsageSnapshot> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    Some(UsageSnapshot {
+        five_hour: v.get("five_hour").and_then(window_from),
+        seven_day: v.get("seven_day").and_then(window_from),
+        effort_level: None,
+        written_at: now_secs,
+    })
 }
 
 /// Parse the shared snapshot file (the emitter's own output, or a hand-rolled one).
@@ -413,6 +434,41 @@ mod tests {
         .unwrap();
         assert_eq!(inp.snapshot.five_hour.unwrap().used_percentage, 0.0);
         assert_eq!(inp.snapshot.seven_day.unwrap().used_percentage, 100.0);
+    }
+
+    // --- OAuth usage endpoint parsing (issue #14) ---
+
+    #[test]
+    fn parses_oauth_usage_response() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tracker/assets/oauth-usage.sample.json"
+        );
+        let data = std::fs::read_to_string(path).expect("fixture present");
+        let snap = parse_oauth_usage(&data, 1_783_690_000).expect("fixture parses");
+        assert_eq!(snap.written_at, 1_783_690_000);
+        let five = snap.five_hour.as_ref().unwrap();
+        assert_eq!(five.used_percentage, 23.5);
+        // ISO resets_at -> epoch: 2026-07-10T15:19:05Z.
+        assert_eq!(five.resets_at, Some(1_783_696_745));
+        assert_eq!(snap.seven_day.as_ref().unwrap().used_percentage, 41.2);
+        // Unknown extra windows (seven_day_opus) are ignored, not an error.
+        assert!(snap.has_windows());
+    }
+
+    #[test]
+    fn oauth_usage_degrades_like_the_statusline_path() {
+        // Windows independently absent; used_percentage naming also accepted; nulls ok.
+        let snap = parse_oauth_usage(
+            r#"{"five_hour":{"used_percentage":250,"resets_at":1738425600},"seven_day":null}"#,
+            7,
+        )
+        .unwrap();
+        assert_eq!(snap.five_hour.as_ref().unwrap().used_percentage, 100.0, "clamped");
+        assert_eq!(snap.five_hour.as_ref().unwrap().resets_at, Some(1738425600));
+        assert!(snap.seven_day.is_none());
+        assert!(parse_oauth_usage("[]", 7).is_none(), "shape-less JSON is None");
+        assert!(parse_oauth_usage("nope", 7).is_none());
     }
 
     // --- snapshot file round-trip ---

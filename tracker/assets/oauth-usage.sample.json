@@ -1,0 +1,6 @@
+{
+  "__note": "Sanitized fixture for the OAuth usage endpoint (issue #14). Synthesized from the documented response shape; percentages/timestamps are fake. Live-validated 2026-07-10: a real 200 response parsed via the same tolerant path (utilization/used_percentage, ISO/epoch resets_at) and rendered on the card.",
+  "five_hour": { "utilization": 23.5, "resets_at": "2026-07-10T15:19:05.000Z" },
+  "seven_day": { "utilization": 41.2, "resets_at": "2026-07-13T13:19:05.000Z" },
+  "seven_day_opus": { "utilization": 12.0, "resets_at": "2026-07-13T13:19:05.000Z" }
+}
