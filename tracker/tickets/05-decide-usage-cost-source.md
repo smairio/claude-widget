@@ -8,6 +8,8 @@ blocked-by: [1, 2]
 parent: map
 ---
 
+> **Partially decided (2026-07-10, via GitHub #3):** the **usage-source** half is settled — **option 1, the official statusline emitter** (account-global, last-known-from-any-session snapshot; OAuth path not needed for v1). See [spike3-findings.md](../assets/spike3-findings.md). **Still open:** the **cost** half (pinned pricing table vs tokens-only, and what "cost" means on a Team seat). Keep this ticket open for the cost decision.
+
 ## Question
 
 Given the spike results ("Spike: which Claude Code signals fire on this machine", "Spike: does rate-limit data exist for a Team seat"), which source feeds the usage-limits gauge, and does the widget show dollar cost?

@@ -22,6 +22,7 @@ Working widget v1 on Khalil's desktop: an always-on-top X11 card, visible over C
 <!-- one line per closed ticket: gist + link -->
 
 - [Spike: which Claude Code signals fire on this machine](tickets/01-spike-which-signals-fire.md) — hooks (incl. `Stop`) DO fire in the VS Code panel; statusLine does NOT; idle keys off `Stop`; permission-dialog events need interactive mode (deferred to #6). Details: [spike2-findings.md](assets/spike2-findings.md).
+- [Spike: does rate-limit data exist for a Team seat](tickets/02-spike-team-seat-rate-limits.md) — YES via official statusline `rate_limits`; usage source = statusline emitter (account-global, last-known-from-any-session); OAuth endpoint not needed. Also: VS Code waiting-state = `PreToolUse(AskUserQuestion)`. Prior art: [Claude-Familiar](https://github.com/NadimJebali/Claude-Familiar). Details: [spike3-findings.md](assets/spike3-findings.md).
 
 ## Not yet specified
 
