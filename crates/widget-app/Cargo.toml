@@ -1,0 +1,19 @@
+[package]
+name = "widget-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Always-on-top desktop widget showing live Claude Code status."
+
+[[bin]]
+name = "claude-widget"
+path = "src/main.rs"
+
+[dependencies]
+widget-core = { path = "../widget-core" }
+eframe = "0.28"
+egui = "0.28"
+tiny_http = "0.12"
+x11rb = "0.13"
+serde_json = "1"

@@ -1,1 +1,5 @@
 .claude/settings.local.json
+/target
+.venv/
+*.pyc
+__pycache__/
