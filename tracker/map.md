@@ -21,6 +21,8 @@ Working widget v1 on Khalil's desktop: an always-on-top X11 card, visible over C
 
 <!-- one line per closed ticket: gist + link -->
 
+- [Spike: which Claude Code signals fire on this machine](tickets/01-spike-which-signals-fire.md) — hooks (incl. `Stop`) DO fire in the VS Code panel; statusLine does NOT; idle keys off `Stop`; permission-dialog events need interactive mode (deferred to #6). Details: [spike2-findings.md](assets/spike2-findings.md).
+
 ## Not yet specified
 
 - Card interactions — what clicking and dragging do (open the session's VS Code window via `vscode://anthropic.claude-code/open`? settings surface? position memory per monitor?). Sharpens after the card prototype.
