@@ -17,6 +17,12 @@ mod transcript;
 /// Loopback port the hooks POST to and the widget listens on.
 const PORT: u16 = 43110;
 
+/// The port the *listener* binds. CW_PORT overrides it so a hermetic test instance can
+/// run beside the real widget; `install`/`uninstall` always write the default port.
+fn listen_port() -> u16 {
+    std::env::var("CW_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(PORT)
+}
+
 fn main() -> eframe::Result<()> {
     match std::env::args().nth(1).as_deref() {
         // The statusline emitter: headless, must work with no display. Claude Code
@@ -80,10 +86,11 @@ fn main() -> eframe::Result<()> {
     // Single instance: bind the listener up front and keep it. If the port is already
     // taken, another widget is running. The same socket is handed to the listener
     // thread, so there is no free-then-rebind race.
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", PORT)) {
+    let port = listen_port();
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(_) => {
-            eprintln!("claude-widget is already running (port {PORT} in use).");
+            eprintln!("claude-widget is already running (port {port} in use).");
             return Ok(());
         }
     };

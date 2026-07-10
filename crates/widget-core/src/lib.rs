@@ -19,6 +19,34 @@ use serde::Deserialize;
 
 pub mod usage;
 pub use usage::*;
+pub mod visuals;
+pub use visuals::*;
+
+/// Reasoning-effort level, as it rides hook payloads (`effort.level`) and the statusline.
+/// Ordered low → max.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl EffortLevel {
+    /// Parse a payload level string. "ultracode" maps to XHigh — the CLI gives both the
+    /// same purple-shimmer treatment (see spike #3). Unknown strings are `None`.
+    pub fn from_level(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Some(EffortLevel::Low),
+            "medium" => Some(EffortLevel::Medium),
+            "high" => Some(EffortLevel::High),
+            "xhigh" | "ultracode" => Some(EffortLevel::XHigh),
+            "max" => Some(EffortLevel::Max),
+            _ => None,
+        }
+    }
+}
 
 /// What a single Claude Code session is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,11 +86,13 @@ pub enum HookEvent {
     Other(String),
 }
 
-/// A parsed hook payload: which session it belongs to, and the event.
+/// A parsed hook payload: which session it belongs to, the event, and the effort level
+/// the payload carried (if any — every hook payload includes `effort.level`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedEvent {
     pub session_id: String,
     pub event: HookEvent,
+    pub effort: Option<EffortLevel>,
 }
 
 #[derive(Debug)]
@@ -96,6 +126,14 @@ struct RawHook {
     /// StopFailure error kind (alternate name some tools use).
     #[serde(default)]
     error_type: Option<String>,
+    /// `{"level": "xhigh"}` — present on every hook payload.
+    #[serde(default)]
+    effort: Option<RawEffort>,
+}
+
+#[derive(Deserialize)]
+struct RawEffort {
+    level: Option<String>,
 }
 
 /// Parse a single hook payload (the JSON delivered on the hook's stdin / HTTP body).
@@ -119,7 +157,11 @@ pub fn parse_hook(json: &str) -> Result<ParsedEvent, ParseError> {
         Some(other) => HookEvent::Other(other.to_string()),
         None => HookEvent::Other(String::new()),
     };
-    Ok(ParsedEvent { session_id, event })
+    let effort = raw
+        .effort
+        .and_then(|e| e.level)
+        .and_then(|l| EffortLevel::from_level(&l));
+    Ok(ParsedEvent { session_id, event, effort })
 }
 
 /// Token usage of a single assistant message. The widget tracks the LATEST message's
@@ -226,6 +268,8 @@ struct Session {
     cwd: Option<String>,
     model: Option<String>,
     usage: Usage,
+    /// Last effort level a hook payload reported for this session.
+    effort: Option<EffortLevel>,
 }
 
 impl Session {
@@ -236,6 +280,7 @@ impl Session {
             cwd: None,
             model: None,
             usage: Usage::default(),
+            effort: None,
         }
     }
 }
@@ -295,6 +340,9 @@ impl Roster {
                     .or_insert_with(|| Session::new_idle(now_ms));
                 entry.state = state;
                 entry.last_activity_ms = now_ms;
+                if ev.effort.is_some() {
+                    entry.effort = ev.effort;
+                }
             }
             None => {
                 self.sessions.remove(&ev.session_id);
@@ -397,6 +445,21 @@ impl Roster {
     /// waking up for the stall backstop.
     pub fn any_working(&self) -> bool {
         self.sessions.values().any(|s| s.state == SessionState::Working)
+    }
+
+    /// The effort level the card should color by: the most recently active *working*
+    /// session that reported one wins; otherwise the most recently active session that
+    /// reported one. `None` when no session has reported an effort.
+    pub fn current_effort(&self) -> Option<EffortLevel> {
+        let best = |working_only: bool| {
+            self.sessions
+                .values()
+                .filter(|s| !working_only || s.state == SessionState::Working)
+                .filter(|s| s.effort.is_some())
+                .max_by_key(|s| s.last_activity_ms)
+                .and_then(|s| s.effort)
+        };
+        best(true).or_else(|| best(false))
     }
 
     /// The single state the card renders, applying the precedence order.
@@ -676,6 +739,44 @@ mod tests {
         assert_eq!(project_label(Some("/home/khalil/Desktop/claude-widget")), "claude-widget");
         assert_eq!(project_label(Some("/x/")), "x");
         assert_eq!(project_label(None), "?");
+    }
+
+    #[test]
+    fn parse_hook_extracts_effort() {
+        let json = r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Bash","effort":{"level":"xhigh"}}"#;
+        assert_eq!(parse_hook(json).unwrap().effort, Some(EffortLevel::XHigh));
+        // Absent / unknown effort degrades to None, never an error.
+        assert_eq!(parse_hook(&hook("Stop", "s1")).unwrap().effort, None);
+        let odd = r#"{"hook_event_name":"Stop","session_id":"s1","effort":{"level":"warp9"}}"#;
+        assert_eq!(parse_hook(odd).unwrap().effort, None);
+    }
+
+    #[test]
+    fn current_effort_prefers_the_active_working_session() {
+        let ev = |event: &str, sid: &str, level: &str| {
+            format!(r#"{{"hook_event_name":"{event}","session_id":"{sid}","effort":{{"level":"{level}"}}}}"#)
+        };
+        let mut r = Roster::new();
+        assert_eq!(r.current_effort(), None);
+        // s1 works at max, then finishes; s2 starts working at low LATER.
+        r.apply_raw_at(&ev("UserPromptSubmit", "s1", "max"), 10).unwrap();
+        assert_eq!(r.current_effort(), Some(EffortLevel::Max));
+        r.apply_raw_at(&ev("Stop", "s1", "max"), 20).unwrap();
+        r.apply_raw_at(&ev("UserPromptSubmit", "s2", "low"), 30).unwrap();
+        // The working session wins even though s1 reported a "louder" effort.
+        assert_eq!(r.current_effort(), Some(EffortLevel::Low));
+        // s2 stops too: fall back to the most recently active session with an effort.
+        r.apply_raw_at(&ev("Stop", "s2", "low"), 40).unwrap();
+        assert_eq!(r.current_effort(), Some(EffortLevel::Low));
+        // Two working sessions: the most recently active one wins.
+        r.apply_raw_at(&ev("UserPromptSubmit", "s1", "high"), 50).unwrap();
+        r.apply_raw_at(&ev("UserPromptSubmit", "s2", "medium"), 60).unwrap();
+        assert_eq!(r.current_effort(), Some(EffortLevel::Medium));
+        // A session with no reported effort never masks one that has it.
+        let mut r2 = Roster::new();
+        r2.apply_raw_at(&hook("UserPromptSubmit", "s9"), 100).unwrap();
+        r2.apply_raw_at(&ev("UserPromptSubmit", "s1", "xhigh"), 50).unwrap();
+        assert_eq!(r2.current_effort(), Some(EffortLevel::XHigh));
     }
 
     /// The seam test, replaying the ACTUAL recorded fixture through the real parser.

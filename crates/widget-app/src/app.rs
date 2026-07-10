@@ -4,7 +4,7 @@ use std::io::Write;
 use std::sync::mpsc::Receiver;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use widget_core::{AggregateState, ParsedEvent, Roster};
+use widget_core::{AggregateState, Backdrop, EffortLevel, ParsedEvent, Roster};
 
 /// A "working" session with no activity for this long is assumed idle (the stall
 /// backstop). Generous so a single long thinking pass is not falsely idled; it exists to
@@ -50,6 +50,8 @@ pub struct WidgetApp {
     /// Snapshot file mtime at the last read, so unchanged files are not re-parsed.
     usage_mtime: Option<std::time::SystemTime>,
     usage_stale_secs: u64,
+    /// Last effort level rendered (for change logging only).
+    last_effort: Option<EffortLevel>,
 }
 
 impl WidgetApp {
@@ -80,6 +82,7 @@ impl WidgetApp {
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(|ms| (ms / 1000).max(1))
                 .unwrap_or(USAGE_STALE_SECS),
+            last_effort: None,
         }
     }
 
@@ -182,12 +185,34 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// Traffic-light color for a gauge tier (RGBs from the Claude Code theme; see spike #3).
+/// Calm/Warn reuse the effort palette (same theme colors); Alert is the CLI's error red.
 fn gauge_color(tier: widget_core::GaugeTier) -> egui::Color32 {
     match tier {
-        widget_core::GaugeTier::Calm => egui::Color32::from_rgb(78, 186, 101),
-        widget_core::GaugeTier::Warn => egui::Color32::from_rgb(255, 193, 7),
+        widget_core::GaugeTier::Calm => rgb(widget_core::EFFORT_GREEN),
+        widget_core::GaugeTier::Warn => rgb(widget_core::EFFORT_AMBER),
         widget_core::GaugeTier::Alert => egui::Color32::from_rgb(255, 107, 128),
     }
+}
+
+fn rgb(c: widget_core::Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
+/// Blend a tint over a base color at `t` (the core's lerp keeps the math in one place).
+fn mix(base: egui::Color32, tint: widget_core::Rgb, t: f32) -> egui::Color32 {
+    rgb(widget_core::lerp_rgb((base.r(), base.g(), base.b()), tint, t))
+}
+
+/// The spark mascot: an 8-armed starburst (long cardinal arms, short diagonals) with a
+/// filled core. `angle` rotates it; everything else is state expressed as color/size.
+fn draw_spark(painter: &egui::Painter, center: egui::Pos2, r: f32, angle: f32, color: egui::Color32) {
+    for i in 0..8 {
+        let a = angle + i as f32 * std::f32::consts::FRAC_PI_4;
+        let (len, width) = if i % 2 == 0 { (r, 3.4) } else { (r * 0.55, 2.4) };
+        let tip = center + egui::vec2(a.cos(), a.sin()) * len;
+        painter.line_segment([center, tip], egui::Stroke::new(width, color));
+    }
+    painter.circle_filled(center, r * 0.24, color);
 }
 
 fn presentation(state: AggregateState) -> (&'static str, egui::Color32) {
@@ -273,11 +298,67 @@ impl eframe::App for WidgetApp {
         // wakes the loop even while idle/unfocused; nothing to schedule here.
 
         let (label, accent) = presentation(agg);
-        let bg = egui::Color32::from_rgb(18, 18, 22);
+
+        // Effort drives the card's color scheme. Live per-session hooks win; the
+        // account-global statusline snapshot is a fallback only while it is FRESH —
+        // a stale snapshot must not tint the card indefinitely.
+        let effort = self.roster.current_effort().or_else(|| {
+            let snap = self.usage.as_ref()?;
+            if (now / 1000).saturating_sub(snap.written_at) > self.usage_stale_secs {
+                return None;
+            }
+            snap.effort_level.as_deref().and_then(EffortLevel::from_level)
+        });
+        if effort != self.last_effort {
+            self.dbg(&format!("effort={effort:?}"));
+            self.last_effort = effort;
+        }
+
+        // Animations run only while the card has something to say (any session working,
+        // or waiting on the user) and the window is visible; otherwise the animation
+        // clock freezes (backdrops render, but static) and no fast repaints are
+        // scheduled — idle CPU stays at the 1s heartbeat. Note the wave keys on
+        // any_working(), not the aggregate: a waiting session outranks Working in the
+        // headline, but another session's wave must keep emanating.
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        let any_working = self.roster.any_working();
+        let animate = (any_working || matches!(agg, AggregateState::Working | AggregateState::WaitingForInput))
+            && !minimized;
+        let anim_t = if animate { now } else { 0 };
+
+        let backdrop = widget_core::effort_backdrop(effort, anim_t);
+        let base = egui::Color32::from_rgb(18, 18, 22);
+        let bg = match &backdrop {
+            Backdrop::Tint { color, blend } => mix(base, *color, *blend),
+            _ => base,
+        };
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg).inner_margin(16.0))
             .show(ctx, |ui| {
+                let card = ui.max_rect();
+                let painter = ui.painter().clone();
+
+                // Max effort: the rainbow-pixel field, under everything else (drawn
+                // first). Cells drift diagonally as `phase` advances. Full-bleed: the
+                // grid covers the frame margin too, not just the content rect.
+                if let Backdrop::RainbowPixels { phase } = backdrop {
+                    const CELL: f32 = 9.0;
+                    let full = card.expand(16.0);
+                    let cols = (full.width() / CELL).ceil() as i32;
+                    let rows = (full.height() / CELL).ceil() as i32;
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let c = widget_core::rainbow_color(phase, (row + col) as f32 * 0.045);
+                            let cell = egui::Rect::from_min_size(
+                                full.min + egui::vec2(col as f32 * CELL, row as f32 * CELL),
+                                egui::vec2(CELL, CELL),
+                            );
+                            painter.rect_filled(cell, 0.0, mix(base, c, 0.30));
+                        }
+                    }
+                }
+
                 // Whole-card drag: hand the move to the window manager exactly ONCE, when a
                 // drag begins. Using `drag_started()` (not `dragged()`) means a plain click
                 // does nothing and the window doesn't jitter during the move.
@@ -290,14 +371,73 @@ impl eframe::App for WidgetApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
-                ui.label(
-                    egui::RichText::new("Claude")
-                        .size(14.0)
-                        .color(egui::Color32::from_gray(210)),
-                );
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(format!("● {label}")).size(24.0).color(accent));
-                ui.add_space(8.0);
+                // Header: the spark mascot, with the status beside it.
+                ui.horizontal(|ui| {
+                    let (m_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::hover());
+                    let center = m_rect.center();
+
+                    // The working wave: staggered purple rings emanating from the mascot
+                    // (purple → transparent → purple), fading as they cross the card.
+                    if animate && any_working {
+                        let max_r = card.width().max(card.height());
+                        for k in 0..3 {
+                            let (prog, alpha) = widget_core::wave_ring(k, 3, anim_t);
+                            if prog < 0.02 {
+                                continue;
+                            }
+                            let c = widget_core::lerp_rgb(
+                                widget_core::WAVE_PURPLE_BRIGHT,
+                                widget_core::WAVE_PURPLE_DIM,
+                                prog,
+                            );
+                            let ring = egui::Color32::from_rgba_unmultiplied(
+                                c.0,
+                                c.1,
+                                c.2,
+                                (alpha * 255.0) as u8,
+                            );
+                            painter.circle_stroke(center, prog * max_r, egui::Stroke::new(7.0, ring));
+                        }
+                    }
+
+                    // The spark's expression is its color/size/motion per state:
+                    // rotating coral while working, red urgency pulse when Claude needs
+                    // you, dimmed at idle, gray with no sessions.
+                    let (color, radius, angle) = match agg {
+                        AggregateState::Working => {
+                            // Wrap time BEFORE the f32 conversion: at epoch-ms magnitude
+                            // an f32 step is ~2^17 ms, which would collapse all arm
+                            // angles into one and freeze the rotation.
+                            let angle = (anim_t % 8000) as f32 / 8000.0 * std::f32::consts::TAU;
+                            (rgb(widget_core::SPARK_CORAL), 16.0, angle)
+                        }
+                        AggregateState::WaitingForInput => {
+                            let s = 0.5
+                                + 0.5
+                                    * ((anim_t % 1200) as f32 / 1200.0 * std::f32::consts::TAU)
+                                        .sin();
+                            (mix(rgb(widget_core::SPARK_CORAL), (240, 70, 60), s), 15.0 + 2.5 * s, 0.0)
+                        }
+                        AggregateState::RateLimited => (rgb((240, 95, 90)), 15.0, 0.0),
+                        AggregateState::Idle => {
+                            (rgb(widget_core::SPARK_CORAL).gamma_multiply(0.55), 14.0, 0.0)
+                        }
+                        AggregateState::NoSessions => (egui::Color32::from_gray(95), 14.0, 0.0),
+                    };
+                    draw_spark(&painter, center, radius, angle, color);
+
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Claude")
+                                .size(13.0)
+                                .color(egui::Color32::from_gray(205)),
+                        );
+                        ui.label(egui::RichText::new(label).size(21.0).color(accent));
+                    });
+                });
+                ui.add_space(6.0);
 
                 // Per-session rows: project · model · tokens.
                 let rows = self.roster.sessions_view();
@@ -385,5 +525,11 @@ impl eframe::App for WidgetApp {
                     }
                 }
             });
+
+        // Schedule the next animation frame (~30 fps) only while animating; otherwise
+        // the 1s heartbeat is the only wakeup and CPU stays near zero.
+        if animate {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
     }
 }
